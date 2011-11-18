@@ -22,33 +22,31 @@ NSString *NPReachabilityChangedNotification = @"NPReachabilityChangedNotificatio
 @property (nonatomic, readwrite) SCNetworkReachabilityFlags currentReachabilityFlags;
 @end
 
-void NPNetworkReachabilityCallBack(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags flags, void *info) {
+static void NPNetworkReachabilityCallBack(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags flags, void *info) {
 	NPReachability *reach = (NPReachability *)info;
     
     // NPReachability maintains its own copy of |flags| so that KVO works 
-    // correctly. Note that +keyPathsForValuesAffectingCurrentlyReachable
-    // ensures that this also fires KVO for the |currentlyReachable| property.
+    // correctly. Note that -setCurrentReachabilityFlags also triggers KVO
+    // for the |currentlyReachable| property.
     [reach setCurrentReachabilityFlags:flags];
     
 	NSArray *allHandlers = [reach _handlers];
 	for (void (^currHandler)(SCNetworkReachabilityFlags flags) in allHandlers) {
 		currHandler(flags);
 	}
-    
-    [[NSNotificationCenter defaultCenter] postNotificationName:NPReachabilityChangedNotification object:reach];
 }
 
-const void * NPReachabilityRetain(const void *info) {
+static const void * NPReachabilityRetain(const void *info) {
 	NPReachability *reach = (NPReachability *)info;
 	return (void*)[reach retain];
 }
-void NPReachabilityRelease(const void *info) {
+static void NPReachabilityRelease(const void *info) {
 	NPReachability *reach = (NPReachability *)info;
 	[reach release];
 }
-CFStringRef NPReachabilityCopyDescription(const void *info) {
+static CFStringRef NPReachabilityCopyDescription(const void *info) {
 	NPReachability *reach = (NPReachability *)info;
-	return (CFStringRef)[reach description];
+	return (CFStringRef)[[reach description] copy];
 }
 
 @implementation NPReachability
@@ -78,11 +76,15 @@ CFStringRef NPReachabilityCopyDescription(const void *info) {
 			SCNetworkReachabilityScheduleWithRunLoop(_reachabilityRef, CFRunLoopGetCurrent(), kCFRunLoopCommonModes);
 		}
         SCNetworkReachabilityGetFlags(_reachabilityRef, &currentReachabilityFlags);
+        
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(applicationWillEnterForeground:) name:UIApplicationWillEnterForegroundNotification object:nil];
 	}
 	return self;
 }
 
 - (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillEnterForegroundNotification object:nil];
+    
     if (_reachabilityRef != NULL) {
         SCNetworkReachabilityUnscheduleFromRunLoop(_reachabilityRef, CFRunLoopGetCurrent(), kCFRunLoopCommonModes);
         CFRelease(_reachabilityRef);
@@ -93,6 +95,18 @@ CFStringRef NPReachabilityCopyDescription(const void *info) {
 	_handlerByOpaqueObject = nil;
     
     [super dealloc];
+}
+
+- (void)applicationWillEnterForeground:(NSNotification *)notification {
+    // We don't receive network reachability flags in the background, usually.
+    // (Exceptions are made for apps like voip or music streaming.)
+    // Update the reachability flags since we're now coming back to the
+    // foreground.
+    
+    SCNetworkReachabilityFlags flags;
+    if (SCNetworkReachabilityGetFlags(_reachabilityRef, &flags)) {
+        [self setCurrentReachabilityFlags:flags];
+    }
 }
 
 - (NSArray *)_handlers {
@@ -113,8 +127,30 @@ CFStringRef NPReachabilityCopyDescription(const void *info) {
 	return [[self class] isReachableWithFlags:[self currentReachabilityFlags]];
 }
 
-+ (NSSet *)keyPathsForValuesAffectingCurrentlyReachable {
-    return [NSSet setWithObject:@"currentReachabilityFlags"];
++ (BOOL)automaticallyNotifiesObserversOfCurrentlyReachable {
+    return NO;
+}
+
+- (void)setCurrentReachabilityFlags:(SCNetworkReachabilityFlags)newReachabilityFlags {
+    if (newReachabilityFlags == currentReachabilityFlags) {
+        return;
+    }
+    
+    BOOL oldCurrentlyReachable = [NPReachability isReachableWithFlags:currentReachabilityFlags];
+    BOOL newCurrentlyReachable = [NPReachability isReachableWithFlags:newReachabilityFlags];
+    BOOL currentlyReachableChanged = (oldCurrentlyReachable != newCurrentlyReachable);
+    
+    if (currentlyReachableChanged) [self willChangeValueForKey:@"currentlyReachable"];
+    [self willChangeValueForKey:@"currentReachabilityFlags"];
+    currentReachabilityFlags = newReachabilityFlags;
+    [self didChangeValueForKey:@"currentReachabilityFlags"];
+    if (currentlyReachableChanged) [self didChangeValueForKey:@"currentlyReachable"];
+    
+    [[NSNotificationCenter defaultCenter] postNotificationName:NPReachabilityChangedNotification object:self];
+}
+
++ (BOOL)automaticallyNotifiesObserversOfCurrentReachabilityFlags {
+    return NO;
 }
 
 + (BOOL)isReachableWithFlags:(SCNetworkReachabilityFlags)flags {
